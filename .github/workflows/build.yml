@@ -325,6 +325,8 @@ jobs:
               private static boolean muted;
               private static int legacyAudioRoute = -1;
               private static final List<CallEndpoint> availableEndpoints = new ArrayList<>();
+              private static boolean manualAudioRouteSelected;
+              private static boolean autoBluetoothRouteAttempted;
 
               private final Call.Callback callCallback = new Call.Callback() {
                   @Override
@@ -359,7 +361,10 @@ jobs:
                   currentCall = call;
                   call.registerCallback(callCallback);
                   muted = false;
-                   syncLegacyAudioRoute();
+                  manualAudioRouteSelected = false;
+                  autoBluetoothRouteAttempted = false;
+                  syncLegacyAudioRoute();
+                  autoRouteToBluetoothIfAvailable();
                   showCallUi();
                   refreshNotification();
               }
@@ -392,6 +397,7 @@ jobs:
                       availableEndpoints.clear();
                       availableEndpoints.addAll(endpoints);
                   }
+                  autoRouteToBluetoothIfAvailable();
                   broadcastUpdate();
               }
 
@@ -405,6 +411,7 @@ jobs:
                   if (audioState != null) {
                       legacyAudioRoute = audioState.getRoute();
                   }
+                  autoRouteToBluetoothIfAvailable();
                   broadcastUpdate();
               }
 
@@ -461,6 +468,7 @@ jobs:
                       return;
                   }
 
+                  manualAudioRouteSelected = true;
                   if (Build.VERSION.SDK_INT >= 34) {
                       CallEndpoint current = instance.getCurrentCallEndpoint();
                       boolean speaker =
@@ -525,6 +533,101 @@ jobs:
                   return isLegacySpeaker(instance);
               }
 
+              public static boolean isBluetoothAvailable() {
+                  if (instance == null || currentCall == null) return false;
+                  if (Build.VERSION.SDK_INT >= 34) {
+                      synchronized (availableEndpoints) {
+                          for (CallEndpoint endpoint : availableEndpoints) {
+                              if (endpoint.getEndpointType() == CallEndpoint.TYPE_BLUETOOTH) return true;
+                          }
+                      }
+                      return false;
+                  }
+                  CallAudioState state = instance.getCallAudioState();
+                  return state != null && (state.getSupportedRouteMask() & CallAudioState.ROUTE_BLUETOOTH) != 0;
+              }
+
+              public static boolean isBluetooth() {
+                  if (instance == null) return false;
+                  if (Build.VERSION.SDK_INT >= 34) {
+                      CallEndpoint endpoint = instance.getCurrentCallEndpoint();
+                      return endpoint != null && endpoint.getEndpointType() == CallEndpoint.TYPE_BLUETOOTH;
+                  }
+                  CallAudioState state = instance.getCallAudioState();
+                  return state != null && state.getRoute() == CallAudioState.ROUTE_BLUETOOTH;
+              }
+
+              public static void useBluetooth() {
+                  if (instance == null || currentCall == null) return;
+                  manualAudioRouteSelected = true;
+                  autoBluetoothRouteAttempted = true;
+                  if (Build.VERSION.SDK_INT >= 34) {
+                      synchronized (availableEndpoints) {
+                          for (CallEndpoint endpoint : availableEndpoints) {
+                              if (endpoint.getEndpointType() == CallEndpoint.TYPE_BLUETOOTH) {
+                                  requestBluetoothEndpoint(instance, endpoint);
+                                  return;
+                              }
+                          }
+                      }
+                  } else {
+                      CallAudioState state = instance.getCallAudioState();
+                      if (state != null && (state.getSupportedRouteMask() & CallAudioState.ROUTE_BLUETOOTH) != 0) {
+                          instance.setAudioRoute(CallAudioState.ROUTE_BLUETOOTH);
+                          legacyAudioRoute = CallAudioState.ROUTE_BLUETOOTH;
+                      }
+                  }
+                  instance.broadcastUpdate();
+              }
+
+              private static void autoRouteToBluetoothIfAvailable() {
+                  if (instance == null || currentCall == null || manualAudioRouteSelected || autoBluetoothRouteAttempted) return;
+                  if (Build.VERSION.SDK_INT >= 34) {
+                      CallEndpoint current = instance.getCurrentCallEndpoint();
+                      if (current != null && current.getEndpointType() == CallEndpoint.TYPE_BLUETOOTH) {
+                          autoBluetoothRouteAttempted = true;
+                          return;
+                      }
+                      synchronized (availableEndpoints) {
+                          for (CallEndpoint endpoint : availableEndpoints) {
+                              if (endpoint.getEndpointType() == CallEndpoint.TYPE_BLUETOOTH) {
+                                  autoBluetoothRouteAttempted = true;
+                                  requestBluetoothEndpoint(instance, endpoint);
+                                  return;
+                              }
+                          }
+                      }
+                      return;
+                  }
+                  CallAudioState state = instance.getCallAudioState();
+                  if (state == null) return;
+                  legacyAudioRoute = state.getRoute();
+                  if (state.getRoute() == CallAudioState.ROUTE_BLUETOOTH) {
+                      autoBluetoothRouteAttempted = true;
+                  } else if ((state.getSupportedRouteMask() & CallAudioState.ROUTE_BLUETOOTH) != 0) {
+                      autoBluetoothRouteAttempted = true;
+                      instance.setAudioRoute(CallAudioState.ROUTE_BLUETOOTH);
+                  }
+              }
+
+              private static void requestBluetoothEndpoint(PhoneInCallService service, CallEndpoint endpoint) {
+                  service.requestCallEndpointChange(
+                      endpoint,
+                      service.getMainExecutor(),
+                      new android.os.OutcomeReceiver<Void, CallEndpointException>() {
+                          @Override
+                          public void onResult(Void result) {
+                              if (instance == service) service.broadcastUpdate();
+                          }
+
+                          @Override
+                          public void onError(CallEndpointException error) {
+                              if (instance == service) service.broadcastUpdate();
+                          }
+                      }
+                  );
+              }
+
               private static boolean isLegacySpeaker(PhoneInCallService service) {
                   syncLegacyAudioRoute();
                   return legacyAudioRoute == CallAudioState.ROUTE_SPEAKER;
@@ -576,17 +679,13 @@ jobs:
                       PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
                   );
 
-                  String title = currentCall.getDetails().getHandle() == null
-                      ? "مكالمة"
-                      : currentCall.getDetails().getHandle().getSchemeSpecificPart();
+                  String title = "مكالمة هاتفية";
                   if (Build.VERSION.SDK_INT >= 30) {
                       String contactName = currentCall.getDetails().getContactDisplayName();
-                      if (contactName != null && !contactName.trim().isEmpty()) {
+                      if (contactName != null && !contactName.trim().isEmpty()
+                              && !contactName.trim().matches("[+()0-9 .-]*[0-9][+()0-9 .-]*")) {
                           title = contactName.trim();
                       }
-                  }
-                  if (title == null || title.trim().isEmpty()) {
-                      title = "مكالمة";
                   }
 
                   Notification.Builder builder;
@@ -694,6 +793,7 @@ jobs:
               private Button rejectButton;
               private Button muteButton;
               private Button speakerButton;
+              private Button bluetoothButton;
               private Button endButton;
 
               private long connectTimeMillis;
@@ -928,6 +1028,7 @@ jobs:
                   LinearLayout.LayoutParams numberParams = matchWrap();
                   numberParams.topMargin = dp(6);
                   root.addView(numberView, numberParams);
+                  numberView.setVisibility(View.GONE);
 
                   timerView = makeText("", 15, Color.rgb(175, 175, 175));
                   LinearLayout.LayoutParams timerParams = matchWrap();
@@ -984,6 +1085,19 @@ jobs:
                   speakerButton.setOnClickListener(
                       v -> PhoneInCallService.toggleSpeaker()
                   );
+                  bluetoothButton = makeControlButton("سماعات الأذن");
+                  bluetoothButton.setContentDescription("توجيه صوت المكالمة إلى سماعات البلوتوث");
+                  bluetoothButton.setOnClickListener(v -> {
+                  if (!PhoneInCallService.isBluetoothAvailable()) {
+                  android.widget.Toast.makeText(
+                  this,
+                  "وصّل سماعات البلوتوث أولًا",
+                  android.widget.Toast.LENGTH_SHORT
+                  ).show();
+                  return;
+                  }
+                  PhoneInCallService.useBluetooth();
+                  });
 
                   LinearLayout.LayoutParams controlParams = weightParams(1f);
                   controlParams.setMargins(dp(6), 0, dp(6), 0);
@@ -992,6 +1106,9 @@ jobs:
                   controlParams = weightParams(1f);
                   controlParams.setMargins(dp(6), 0, dp(6), 0);
                   ongoingActions.addView(speakerButton, controlParams);
+                  controlParams = weightParams(1f);
+                  controlParams.setMargins(dp(4), 0, dp(4), 0);
+                  ongoingActions.addView(bluetoothButton, controlParams);
 
                   root.addView(ongoingActions, ongoingParams);
 
@@ -1035,15 +1152,10 @@ jobs:
                   }
               }
 
-              private String safeNumber(Call call) {
-                  if (call == null || call.getDetails() == null) {
-                      return "";
-                  }
-                  if (call.getDetails().getHandle() == null) {
-                      return "";
-                  }
-                  String number = call.getDetails().getHandle().getSchemeSpecificPart();
-                  return number == null ? "" : number;
+
+              private boolean looksLikePhoneNumber(String value) {
+                  return !TextUtils.isEmpty(value)
+                          && value.trim().matches("[+()0-9 .-]*[0-9][+()0-9 .-]*");
               }
 
               private String safeCallerName(Call call) {
@@ -1053,13 +1165,13 @@ jobs:
 
                   if (Build.VERSION.SDK_INT >= 30) {
                       String contactName = call.getDetails().getContactDisplayName();
-                      if (!TextUtils.isEmpty(contactName)) {
+                      if (!TextUtils.isEmpty(contactName) && !looksLikePhoneNumber(contactName)) {
                           return contactName.trim();
                       }
                   }
 
                   String callerName = call.getDetails().getCallerDisplayName();
-                  if (!TextUtils.isEmpty(callerName)) {
+                  if (!TextUtils.isEmpty(callerName) && !looksLikePhoneNumber(callerName)) {
                       return callerName.trim();
                   }
 
@@ -1081,25 +1193,19 @@ jobs:
                       return;
                   }
 
-                  String number = safeNumber(call);
                   String callerName = safeCallerName(call);
 
                   if (TextUtils.isEmpty(callerName)) {
                       nameView.setText(
-                          TextUtils.isEmpty(number)
-                              ? "رقم غير معروف"
-                              : "رقم غير محفوظ"
+                          "رقم غير محفوظ"
                       );
                   } else {
                       nameView.setText(callerName);
                   }
 
-                  numberView.setText(
-                      TextUtils.isEmpty(number)
-                          ? "رقم مخفي أو غير متاح"
-                          : number
-                  );
-                  avatarView.setText(avatarLetter(callerName, number));
+                  numberView.setText("");
+                  numberView.setVisibility(View.GONE);
+                  avatarView.setText(avatarLetter(callerName, ""));
 
                   int state = call.getDetails().getState();
                   boolean ringing = state == Call.STATE_RINGING;
@@ -1132,13 +1238,23 @@ jobs:
                   );
                   speakerButton.setText(
                       PhoneInCallService.isSpeaker()
-                          ? "السماعة"
-                          : "الميكروفون"
+                          ? "إيقاف مكبر الصوت"
+                          : "مكبر الصوت"
                   );
                   speakerButton.setContentDescription(
                       PhoneInCallService.isSpeaker()
-                          ? "السماعة، اضغط للتبديل"
-                          : "الميكروفون، اضغط للتبديل"
+                          ? "إيقاف مكبر الصوت"
+                          : "تشغيل مكبر الصوت"
+                  );
+                  bluetoothButton.setText(
+                      PhoneInCallService.isBluetooth()
+                          ? "سماعات متصلة"
+                          : "سماعات الأذن"
+                  );
+                  bluetoothButton.setContentDescription(
+                      PhoneInCallService.isBluetooth()
+                          ? "صوت المكالمة على سماعات البلوتوث"
+                          : "توجيه صوت المكالمة إلى سماعات البلوتوث"
                   );
 
                   renderTimer();
@@ -1342,6 +1458,13 @@ jobs:
            grep -n 'onCallAudioStateChanged' android/app/src/main/java/com/dailer/phone/PhoneInCallService.java
            grep -n 'legacyAudioRoute' android/app/src/main/java/com/dailer/phone/PhoneInCallService.java
            grep -n 'setAudioRoute' android/app/src/main/java/com/dailer/phone/PhoneInCallService.java
+           grep -n 'public static void useBluetooth' android/app/src/main/java/com/dailer/phone/PhoneInCallService.java
+           grep -n 'CallEndpoint.TYPE_BLUETOOTH' android/app/src/main/java/com/dailer/phone/PhoneInCallService.java
+           grep -n 'CallAudioState.ROUTE_BLUETOOTH' android/app/src/main/java/com/dailer/phone/PhoneInCallService.java
+           grep -n 'bluetoothButton' android/app/src/main/java/com/dailer/phone/InCallActivity.java
+           grep -n 'numberView.setVisibility(View.GONE)' android/app/src/main/java/com/dailer/phone/InCallActivity.java
+           ! grep -n 'getSchemeSpecificPart' android/app/src/main/java/com/dailer/phone/InCallActivity.java
+           ! grep -n 'getSchemeSpecificPart' android/app/src/main/java/com/dailer/phone/PhoneInCallService.java
           ! grep -n 'new Notification.Builder(this)' android/app/src/main/java/com/dailer/phone/PhoneInCallService.java
           ! grep -n '\.getState()' android/app/src/main/java/com/dailer/phone/PhoneInCallService.java
           ! grep -n '\.getState()' android/app/src/main/java/com/dailer/phone/InCallActivity.java
@@ -1378,7 +1501,7 @@ jobs:
         run: |
           set -euo pipefail
           payload=$(cat <<JSON
-          {"owner":"TomasThrawat","repo":"${{ github.event.repository.name }}","runId":${{ github.run_id }},"artifactName":"هاتف-arm64-v8a-release-apk","sha":"${{ github.sha }}"}
+          {"owner":"${{ github.repository_owner }}","repo":"${{ github.event.repository.name }}","runId":${{ github.run_id }},"artifactName":"هاتف-arm64-v8a-release-apk","sha":"${{ github.sha }}"}
           JSON
           )
           for attempt in 1 2 3; do
