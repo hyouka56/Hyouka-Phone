@@ -1494,6 +1494,7 @@ jobs:
           if-no-files-found: error
 
       - name: Send successful APK to Telegram
+        continue-on-error: true
         if: ${{ success() }}
         env:
           HYOUKA_BUILD_WEBHOOK: https://hyouka-http-mcp.vercel.app/api/telegram-build
